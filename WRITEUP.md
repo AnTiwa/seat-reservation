@@ -107,7 +107,7 @@ Explicit **cancellation** (`POST /reservations/{id}/cancel`) is implemented and 
 
 ## 4. Consistency vs. Availability Under a Partition
 
-This service chooses **consistency over availability** (CP in CAP).
+This service chooses **consistency over availability**
 
 - All reads and writes go through a single PostgreSQL instance.
 - If the database is unreachable, the `/health/ready` endpoint returns `503` and a load balancer can stop sending traffic.
@@ -162,29 +162,22 @@ AI tools (Claude) were used and directed as follows:
 | WRITEUP | Outlined the key design decisions myself; used AI to improve phrasing and structure |
 | Logging setup | Designed the per-startup timestamped file pattern; AI generated the RotatingFileHandler wiring |
 
-**Depth note:** I can extend this service live — e.g., adding a hold/expiry model, switching to event sourcing, or adding a read replica for `GET /shows` — because the design decisions are genuinely mine. The AI accelerated implementation velocity but did not make architectural choices.
-
 ---
 
 ## 7. What I'd Do Next
 
 1. **JWT authentication** — replace the Bearer-token-as-user-id shortcut with OIDC/JWT validation.
-2. **Database migrations** — replace the idempotent `CREATE TABLE IF NOT EXISTS` schema with Alembic migrations for safe production rollouts.
-3. **Timed holds** — add a `held_until TIMESTAMPTZ` column and a background cleanup task to support a hold→pay→confirm flow.
-4. **Read replica** — route `GET /shows` to a read replica to reduce load on the primary during burst reads.
-5. **Prometheus push gateway + multiprocess mode** — needed if running more than one Uvicorn worker.
-6. **Distributed tracing** — OpenTelemetry spans across the DB pool to pinpoint lock-wait latency under load.
-7. **Rate limiting** — per-IP or per-user request throttling to prevent a single client from monopolising the connection pool.
-8. **Alerting + dashboards** — Grafana dashboard with the key counters above; PagerDuty for the P0 conditions.
-9. **CI/CD** — GitHub Actions pipeline: lint → unit tests → integration tests against a docker-compose stack → deploy to Fly.io on merge to main.
-10. **Larger load tests** — k6 or Locust script targeting 20,000 RPS from multiple regions to validate the Postgres connection pool sizing.
+2. **Timed holds** — add a `held_until TIMESTAMPTZ` column and a background cleanup task to support a hold→pay→confirm flow.
+3. **Read replica** — route `GET /shows` to a read replica to reduce load on the primary during burst reads.
+4. **Rate limiting** — per-IP or per-user request throttling to prevent a single client from monopolising the connection pool.
+5. **Alerting + dashboards** — Grafana dashboard with the key counters above; PagerDuty for the P0 conditions.
+6. **Larger load tests** — targeting more than 20,000 RPS to validate the Postgres connection pool sizing.
 
 ---
 
 ## 8. Live URL
 
-> **Deployment pending.** The service is containerised and ready for deployment to Render/Railway/Fly.io.  
-> Live URL will be added here once deployed.
+> **URL** https://seat-reservation-zzba.onrender.com/
 
 **To run locally from a clean checkout:**
 ```bash
