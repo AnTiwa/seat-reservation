@@ -5,7 +5,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from prometheus_client import make_asgi_app
@@ -615,31 +615,18 @@ def get_show(show_id: str):
                 }
             }
         },
-        "parameters": [
-            {
-                "name": "Authorization",
-                "in": "header",
-                "required": True,
-                "schema": {"type": "string", "example": "Bearer alice"},
-                "description": "Bearer token — value is used as user identity.",
-            },
-            {
-                "name": "Idempotency-Key",
-                "in": "header",
-                "required": True,
-                "schema": {"type": "string", "example": "550e8400-e29b-41d4-a716-446655440000"},
-                "description": "Unique key per logical reservation attempt. Safe to retry on network failure.",
-            },
-        ],
     },
 )
 def reserve(
     show_id: str,
     body: ReserveRequest,
-    authorization: str | None = Header(default=None),
-    idempotency_key: str | None = Header(default=None),
+    user_id: str = Depends(get_current_user),
+    idempotency_key: str | None = Header(
+        default=None,
+        description="Unique key per logical reservation attempt. Safe to retry on network failure.",
+        example="550e8400-e29b-41d4-a716-446655440000",
+    ),
 ):
-    user_id = get_current_user(authorization)
 
     if not idempotency_key:
         raise HTTPException(
@@ -1074,23 +1061,11 @@ def reserve(
             "content": {"application/json": {"example": {"detail": "reservation not found"}}},
         },
     },
-    openapi_extra={
-        "parameters": [
-            {
-                "name": "Authorization",
-                "in": "header",
-                "required": True,
-                "schema": {"type": "string", "example": "Bearer alice"},
-                "description": "Bearer token — must match the reservation owner.",
-            },
-        ],
-    },
 )
 def cancel_reservation(
     reservation_id: str,
-    authorization: str | None = Header(default=None),
+    user_id: str = Depends(get_current_user),
 ):
-    user_id = get_current_user(authorization)
 
     try:
         reservation_uuid = uuid.UUID(reservation_id)

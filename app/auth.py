@@ -1,20 +1,22 @@
-from fastapi import Header, HTTPException
+from fastapi import HTTPException, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+bearer_scheme = HTTPBearer(
+    auto_error=False,
+    description="Enter your username here (it will be passed as a Bearer token). E.g. 'alice'.",
+)
 
 
-def get_current_user(authorization: str | None = Header(default=None)) -> str:
-    if not authorization:
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Security(bearer_scheme),
+) -> str:
+    if not credentials:
         raise HTTPException(
             status_code=401,
             detail="missing authorization",
         )
 
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=401,
-            detail="invalid authorization",
-        )
-
-    token = authorization.removeprefix("Bearer ").strip()
+    token = credentials.credentials.strip()
 
     if not token:
         raise HTTPException(
