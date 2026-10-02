@@ -6,7 +6,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from prometheus_client import make_asgi_app
 
@@ -35,29 +35,159 @@ async def lifespan(app: FastAPI):
     close_pool()
 
 
+# ---------------------------------------------------------------------------
+# OpenAPI / Swagger metadata
+# ---------------------------------------------------------------------------
+
+_DESCRIPTION = """
+## Seat Reservation Service
+
+A concurrency-safe seat reservation API that guarantees:
+
+- **No double-sell** — a seat confirmed for one user can never be confirmed for another.
+- **All-or-nothing multi-seat** — either every requested seat is reserved or none is.
+- **Per-user seat limit** — enforced atomically under high concurrency.
+- **Idempotent retries** — the same `Idempotency-Key` always returns the same reservation.
+- **Owner-only cancellation** — identity is always derived from the Bearer token.
+
+### Authentication
+
+Pass `Authorization: Bearer <user_id>` on every reservation and cancellation request.  
+In this exercise the token value is used directly as the user ID (production would validate a JWT).
+
+### Idempotency
+
+Every `POST /shows/{id}/reserve` request **must** include an `Idempotency-Key` header.  
+Retrying with the same key and the same body returns the original reservation (HTTP 201).  
+Reusing the same key with a different body returns HTTP 409.
+
+### Money
+
+All monetary values are **integer paise** (₹0.01 units). Floats are never used.
+"""
+
+_TAGS = [
+    {
+        "name": "shows",
+        "description": "Create shows and inspect per-seat state.",
+    },
+    {
+        "name": "reservations",
+        "description": "Reserve seats and cancel reservations.",
+    },
+    {
+        "name": "health",
+        "description": "Liveness and readiness probes for load-balancer / orchestrator use.",
+    },
+]
+
 app = FastAPI(
     title="Seat Reservation Service",
     version="1.0.0",
+    description=_DESCRIPTION,
+    contact={
+        "name": "Engineering",
+        "email": "eng@example.com",
+    },
+    license_info={
+        "name": "MIT",
+    },
+    openapi_tags=_TAGS,
     lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc",
 )
 
 app.mount("/metrics", make_asgi_app())
 
 
+@app.get("/", include_in_schema=False)
+def root():
+    """Redirect browser root to the interactive Swagger UI."""
+    return RedirectResponse(url="/docs")
+
+
+# ---------------------------------------------------------------------------
+# Request / Response models
+# ---------------------------------------------------------------------------
+
 class CreateShowRequest(BaseModel):
-    name: str = Field(min_length=1)
-    seats: list[str] = Field(min_length=1)
-    price_paise: int = Field(ge=0)
-    per_user_limit: int = Field(default=4, ge=1)
+    name: str = Field(
+        min_length=1,
+        description="Human-readable show name.",
+        examples=["friday-night"],
+    )
+    seats: list[str] = Field(
+        min_length=1,
+        description="Ordered list of unique seat identifiers for this show.",
+        examples=[["A1", "A2", "A3", "A4", "B1", "B2"]],
+    )
+    price_paise: int = Field(
+        ge=0,
+        description="Ticket price in integer paise (₹0.01 units). Must be ≥ 0. Never a float.",
+        examples=[25000],
+    )
+    per_user_limit: int = Field(
+        default=4,
+        ge=1,
+        description="Maximum seats a single user may reserve for this show.",
+        examples=[4],
+    )
+
+
+class SeatStatus(BaseModel):
+    seat_number: str = Field(description="Seat identifier, e.g. 'A1'.")
+    status: str = Field(description="One of: available | held | confirmed.")
+
+
+class ShowCounts(BaseModel):
+    available: int
+    held: int
+    confirmed: int
+
+
+class ShowResponse(BaseModel):
+    id: str = Field(description="UUID of the show.")
+    name: str
+    price_paise: int
+    per_user_limit: int
+    total_seats: int
+    counts: ShowCounts
+    seats: list[SeatStatus]
+
+
+class CreateShowResponse(BaseModel):
+    id: str = Field(description="UUID of the newly created show.")
+    name: str
+    seats: list[SeatStatus]
+    price_paise: int
+    per_user_limit: int
 
 
 class ReserveRequest(BaseModel):
-    seats: list[str] = Field(min_length=1)
+    seats: list[str] = Field(
+        min_length=1,
+        description="List of seat identifiers to reserve (all-or-nothing).",
+        examples=[["A1"]],
+    )
+
+
+class ReservationResponse(BaseModel):
+    reservation_id: str = Field(description="UUID of the created reservation.")
+    show_id: str
+    user_id: str = Field(description="Derived from the Bearer token — never from the request body.")
+    seats: list[str]
+    amount_paise: int = Field(description="Total charge in integer paise.")
+    status: str = Field(description="'confirmed' on success.")
 
 
 class CancelResponse(BaseModel):
     reservation_id: str
-    status: str
+    status: str = Field(description="Always 'cancelled' on success.")
+
+
+class HealthResponse(BaseModel):
+    status: str = Field(description="'ok' (liveness) or 'ready' / 'not_ready' (readiness).")
 
 
 def request_hash(seats: list[str]) -> str:
@@ -173,31 +303,92 @@ async def request_logging(request: Request, call_next):
     return response
 
 
-@app.get("/health/live")
+@app.get(
+    "/health/live",
+    tags=["health"],
+    summary="Liveness probe",
+    description="Returns 200 as long as the process is alive. Use this as a Kubernetes/Docker liveness check.",
+    response_model=HealthResponse,
+    responses={
+        200: {"description": "Process is alive.", "content": {"application/json": {"example": {"status": "ok"}}}},
+    },
+)
 def liveness():
-    return {
-        "status": "ok",
-    }
+    return {"status": "ok"}
 
 
-@app.get("/health/ready")
+@app.get(
+    "/health/ready",
+    tags=["health"],
+    summary="Readiness probe",
+    description=(
+        "Executes `SELECT 1` against PostgreSQL. "
+        "Returns 200 when the database is reachable, 503 otherwise. "
+        "A load balancer should stop routing traffic on 503."
+    ),
+    response_model=HealthResponse,
+    responses={
+        200: {"description": "Database reachable.", "content": {"application/json": {"example": {"status": "ready"}}}},
+        503: {"description": "Database unreachable — service fails closed.", "content": {"application/json": {"example": {"status": "not_ready"}}}},
+    },
+)
 def readiness():
     try:
         with pool.connection() as conn:
             conn.execute("SELECT 1")
-        return {
-            "status": "ready",
-        }
+        return {"status": "ready"}
     except Exception:
         return JSONResponse(
             status_code=503,
-            content={
-                "status": "not_ready",
-            },
+            content={"status": "not_ready"},
         )
 
 
-@app.post("/shows", status_code=201)
+@app.post(
+    "/shows",
+    status_code=201,
+    tags=["shows"],
+    summary="Create a show",
+    description=(
+        "Creates a new show with a fixed set of numbered seats. "
+        "All seats start in **available** state. "
+        "This is an admin operation — no auth required in this exercise."
+    ),
+    response_model=CreateShowResponse,
+    responses={
+        201: {"description": "Show created successfully."},
+        400: {"description": "Validation error — e.g. duplicate seat numbers.",
+              "content": {"application/json": {"example": {"detail": "duplicate seat numbers"}}}},
+    },
+    openapi_extra={
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "small_show": {
+                            "summary": "4-seat show",
+                            "value": {
+                                "name": "friday-night",
+                                "seats": ["A1", "A2", "A3", "A4"],
+                                "price_paise": 25000,
+                                "per_user_limit": 4,
+                            },
+                        },
+                        "large_show": {
+                            "summary": "100-seat hall",
+                            "value": {
+                                "name": "saturday-gala",
+                                "seats": [f"A{i}" for i in range(1, 101)],
+                                "price_paise": 50000,
+                                "per_user_limit": 2,
+                            },
+                        },
+                    }
+                }
+            }
+        }
+    },
+)
 def create_show(body: CreateShowRequest):
     if len(body.seats) != len(set(body.seats)):
         raise HTTPException(
@@ -261,7 +452,22 @@ def create_show(body: CreateShowRequest):
     }
 
 
-@app.get("/shows/{show_id}")
+@app.get(
+    "/shows/{show_id}",
+    tags=["shows"],
+    summary="Get show state",
+    description=(
+        "Returns the current state of every seat and aggregate counts. "
+        "The reconciliation invariant `available + held + confirmed == total_seats` "
+        "is asserted server-side on every response."
+    ),
+    response_model=ShowResponse,
+    responses={
+        200: {"description": "Show state."},
+        404: {"description": "Show not found.",
+              "content": {"application/json": {"example": {"detail": "show not found"}}}},
+    },
+)
 def get_show(show_id: str):
     try:
         show_uuid = uuid.UUID(show_id)
@@ -343,7 +549,90 @@ def get_show(show_id: str):
     }
 
 
-@app.post("/shows/{show_id}/reserve", status_code=201)
+@app.post(
+    "/shows/{show_id}/reserve",
+    status_code=201,
+    tags=["reservations"],
+    summary="Reserve seats",
+    description=(
+        "Atomically reserves one or more seats for the authenticated user.\n\n"
+        "**Semantics:** all-or-nothing — if any requested seat is unavailable the entire request is rejected.\n\n"
+        "**Idempotency-Key** (required header): retrying with the same key and body returns the original "
+        "reservation. Reusing the key with different seats returns 409.\n\n"
+        "**Identity** is always derived from the Bearer token — a `user_id` field in the body is ignored."
+    ),
+    response_model=ReservationResponse,
+    responses={
+        201: {"description": "Seats reserved successfully."},
+        400: {
+            "description": "Missing `Idempotency-Key` header, or duplicate seats in request.",
+            "content": {"application/json": {"example": {"detail": "Idempotency-Key header is required"}}},
+        },
+        401: {
+            "description": "Missing or invalid Authorization header.",
+            "content": {"application/json": {"example": {"detail": "missing authorization"}}},
+        },
+        404: {
+            "description": "Show or seat not found.",
+            "content": {"application/json": {"example": {"detail": "show not found"}}},
+        },
+        409: {
+            "description": "Seat already taken / per-user limit exceeded / idempotency key conflict.",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "seat_taken": {
+                            "summary": "Seat already taken",
+                            "value": {"detail": {"reason": "seat-taken", "seats": ["A1"]}},
+                        },
+                        "user_limit": {
+                            "summary": "Per-user limit exceeded",
+                            "value": {"detail": "per-user seat limit exceeded"},
+                        },
+                        "idempotency_mismatch": {
+                            "summary": "Same key, different seats",
+                            "value": {"detail": "idempotency key already used with different request"},
+                        },
+                    }
+                }
+            },
+        },
+    },
+    openapi_extra={
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "single_seat": {
+                            "summary": "Single seat",
+                            "value": {"seats": ["A1"]},
+                        },
+                        "multi_seat": {
+                            "summary": "Two seats (all-or-nothing)",
+                            "value": {"seats": ["A1", "A2"]},
+                        },
+                    }
+                }
+            }
+        },
+        "parameters": [
+            {
+                "name": "Authorization",
+                "in": "header",
+                "required": True,
+                "schema": {"type": "string", "example": "Bearer alice"},
+                "description": "Bearer token — value is used as user identity.",
+            },
+            {
+                "name": "Idempotency-Key",
+                "in": "header",
+                "required": True,
+                "schema": {"type": "string", "example": "550e8400-e29b-41d4-a716-446655440000"},
+                "description": "Unique key per logical reservation attempt. Safe to retry on network failure.",
+            },
+        ],
+    },
+)
 def reserve(
     show_id: str,
     body: ReserveRequest,
@@ -752,7 +1041,50 @@ def reserve(
 
 @app.post(
     "/reservations/{reservation_id}/cancel",
+    tags=["reservations"],
+    summary="Cancel a reservation",
+    description=(
+        "Atomically cancels a reservation and releases all its seats back to **available**.\n\n"
+        "Only the reservation owner (identified by the Bearer token) may cancel.\n\n"
+        "**Idempotent:** cancelling an already-cancelled reservation returns 200 without double-releasing."
+    ),
     response_model=CancelResponse,
+    responses={
+        200: {
+            "description": "Reservation cancelled (or was already cancelled).",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "reservation_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "status": "cancelled",
+                    }
+                }
+            },
+        },
+        401: {
+            "description": "Missing or invalid Authorization header.",
+            "content": {"application/json": {"example": {"detail": "missing authorization"}}},
+        },
+        403: {
+            "description": "Caller is not the reservation owner.",
+            "content": {"application/json": {"example": {"detail": "not reservation owner"}}},
+        },
+        404: {
+            "description": "Reservation not found.",
+            "content": {"application/json": {"example": {"detail": "reservation not found"}}},
+        },
+    },
+    openapi_extra={
+        "parameters": [
+            {
+                "name": "Authorization",
+                "in": "header",
+                "required": True,
+                "schema": {"type": "string", "example": "Bearer alice"},
+                "description": "Bearer token — must match the reservation owner.",
+            },
+        ],
+    },
 )
 def cancel_reservation(
     reservation_id: str,
